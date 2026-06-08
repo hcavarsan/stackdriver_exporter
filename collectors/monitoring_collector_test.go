@@ -14,9 +14,60 @@
 package collectors
 
 import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/api/monitoring/v3"
+	"google.golang.org/api/option"
 )
+
+func newTestMonitoringService(t *testing.T, handler http.HandlerFunc) *monitoring.Service {
+	t.Helper()
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	service, err := monitoring.NewService(context.Background(),
+		option.WithEndpoint(server.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatalf("creating test monitoring service: %v", err)
+	}
+	return service
+}
+
+func writeJSONResponse(t *testing.T, w http.ResponseWriter, v any) {
+	t.Helper()
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Errorf("encoding test response: %v", err)
+	}
+}
+
+// Fake delta stores, we can't use the real ones because the delta package
+// imports collectors.
+type noopCounterStore struct{}
+
+func (s *noopCounterStore) Increment(*monitoring.MetricDescriptor, *ConstMetric) {}
+
+func (s *noopCounterStore) ListMetrics(string) []*ConstMetric { return nil }
+
+type noopHistogramStore struct{}
+
+func (s *noopHistogramStore) Increment(*monitoring.MetricDescriptor, *HistogramMetric) {}
+
+func (s *noopHistogramStore) ListMetrics(string) []*HistogramMetric { return nil }
 
 func TestIsGoogleMetric(t *testing.T) {
 	good := []string{
@@ -111,5 +162,93 @@ func TestProjectResource(t *testing.T) {
 
 	if got := projectResource("fake-project-1"); got != "projects/fake-project-1" {
 		t.Fatalf("projectResource() = %q, want %q", got, "projects/fake-project-1")
+	}
+}
+
+func TestReportMonitoringMetricsDeduplicatesDescriptorsAcrossPages(t *testing.T) {
+	t.Parallel()
+
+	const (
+		projectID  = "test-project"
+		metricType = "pubsub.googleapis.com/subscription/num_undelivered_messages"
+	)
+
+	var (
+		descriptorPages   atomic.Int32
+		timeSeriesQueries atomic.Int32
+	)
+
+	endTime := time.Now().UTC().Format(time.RFC3339Nano)
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/metricDescriptors"):
+			descriptorPages.Add(1)
+			// Same type on both pages
+			resp := &monitoring.ListMetricDescriptorsResponse{
+				MetricDescriptors: []*monitoring.MetricDescriptor{
+					{Type: metricType, MetricKind: "GAUGE", ValueType: "DOUBLE", Unit: "1"},
+				},
+			}
+			if r.URL.Query().Get("pageToken") == "" {
+				resp.NextPageToken = "page-2"
+			}
+			writeJSONResponse(t, w, resp)
+		case strings.HasSuffix(r.URL.Path, "/timeSeries"):
+			timeSeriesQueries.Add(1)
+			value := 1.0
+			resp := &monitoring.ListTimeSeriesResponse{
+				TimeSeries: []*monitoring.TimeSeries{
+					{
+						Metric:     &monitoring.Metric{Type: metricType, Labels: map[string]string{"subscription_id": "subscription-a"}},
+						Resource:   &monitoring.MonitoredResource{Type: "pubsub_subscription", Labels: map[string]string{"project_id": projectID}},
+						MetricKind: "GAUGE",
+						ValueType:  "DOUBLE",
+						Points: []*monitoring.Point{
+							{
+								Interval: &monitoring.TimeInterval{EndTime: endTime},
+								Value:    &monitoring.TypedValue{DoubleValue: &value},
+							},
+						},
+					},
+				},
+			}
+			writeJSONResponse(t, w, resp)
+		default:
+			t.Errorf("unexpected request path: %s", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}
+
+	service := newTestMonitoringService(t, handler)
+
+	collector, err := NewMonitoringCollector(
+		projectID,
+		service,
+		MonitoringCollectorOptions{
+			MetricTypePrefixes: []string{metricType},
+			RequestInterval:    5 * time.Minute,
+		},
+		slog.New(slog.DiscardHandler),
+		&noopCounterStore{},
+		&noopHistogramStore{},
+	)
+	if err != nil {
+		t.Fatalf("NewMonitoringCollector() error = %v", err)
+	}
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+
+	if _, err := registry.Gather(); err != nil {
+		t.Fatalf("Gather() returned an error, the descriptor was fetched more than once: %v", err)
+	}
+
+	if got := descriptorPages.Load(); got != 2 {
+		t.Fatalf("expected both descriptor pages to be listed, got %d page request(s)", got)
+	}
+
+	if got := timeSeriesQueries.Load(); got != 1 {
+		t.Fatalf("expected exactly one time series query, got %d", got)
 	}
 }

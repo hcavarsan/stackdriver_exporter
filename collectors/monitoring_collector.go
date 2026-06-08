@@ -399,10 +399,12 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 			} else {
 				var cache []*monitoring.MetricDescriptor
 
+				// Get every page first, then dedupe, the same metric type can show
+				// up on more than one page, so deduping per page would fetch it twice
 				callback := func(r *monitoring.ListMetricDescriptorsResponse) error {
 					c.apiCallsTotalMetric.Inc()
 					cache = append(cache, r.MetricDescriptors...)
-					return metricDescriptorsFunction(r.MetricDescriptors)
+					return nil
 				}
 
 				c.logger.Debug("listing Google Stackdriver Monitoring metric descriptors starting with", "prefix", metricsTypePrefix)
@@ -410,6 +412,12 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 					Filter(filter).
 					Pages(ctx, callback); err != nil {
 					errChannel <- err
+					return
+				}
+
+				if err := metricDescriptorsFunction(cache); err != nil {
+					errChannel <- err
+					return
 				}
 
 				c.descriptorCache.Store(metricsTypePrefix, cache)
